@@ -5,7 +5,7 @@
 //! actually inspects are deserialized; everything else is ignored so a
 //! tool-manifest schema bump that adds fields won't break parsing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
@@ -45,6 +45,58 @@ pub struct Manifest {
     /// Tool entries keyed by binary basename.
     #[serde(default)]
     pub tools: BTreeMap<String, ToolEntry>,
+    /// System executables resolvable on `PATH` outside the local-bin dir.
+    ///
+    /// Not part of the on-disk schema (`#[serde(skip)]`); the caller fills
+    /// this in after load via [`system_binaries`]. A binary absent from
+    /// `tools` but present here is a stock system tool the manifest never
+    /// claims to track, so it is NOT drift — see [`classify`]. Empty by
+    /// default, which keeps `BinaryMissing` firing for any unknown binary
+    /// (the behaviour unit tests assert directly).
+    #[serde(skip)]
+    pub system_bins: BTreeSet<String>,
+}
+
+/// Collect executable basenames found on `PATH`, excluding the local-bin dir.
+///
+/// `~/.local/bin` is where this machine's custom tools live, and the
+/// `tool-manifest` is meant to cover exactly those — so a local tool missing
+/// from the manifest is genuine drift and must NOT be suppressed. Everything
+/// else on `PATH` (`/usr/bin`, `/bin`, …) is stock system tooling the manifest
+/// makes no claim about; listing those names lets [`classify`] silence the
+/// `BinaryMissing` false positives that otherwise flood AC7 (`git`, `sed`,
+/// `cargo`, `jq`, …).
+#[must_use]
+pub fn system_binaries() -> BTreeSet<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let local_bin = std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/bin"));
+    let Some(path) = std::env::var_os("PATH") else {
+        return BTreeSet::new();
+    };
+
+    let mut names = BTreeSet::new();
+    for dir in std::env::split_paths(&path) {
+        // Skip the local-bin dir: those tools are the manifest's job to track.
+        if local_bin.as_deref() == Some(dir.as_path()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            // Regular file (or symlink to one) with any execute bit set.
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Load and parse the manifest from disk.
@@ -74,6 +126,14 @@ pub fn load_manifest(path: &Path) -> Result<Manifest> {
 #[must_use]
 pub fn classify(invocation: &Invocation, manifest: &Manifest) -> Vec<Drift> {
     let Some(tool) = manifest.tools.get(&invocation.binary) else {
+        // A binary the manifest doesn't track is only drift if it isn't a
+        // stock system tool. `git`/`sed`/`cargo`/… resolve on PATH and are
+        // out of the manifest's scope, so flagging them is a false positive
+        // (AC7). A name resolvable nowhere — e.g. a stale `~/.local/bin`
+        // entry from self-review's bootstrap list — stays `BinaryMissing`.
+        if manifest.system_bins.contains(&invocation.binary) {
+            return Vec::new();
+        }
         return vec![Drift {
             invocation: invocation.clone(),
             kind: DriftKind::BinaryMissing,
@@ -148,6 +208,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), v.clone()))
                 .collect(),
+            system_bins: BTreeSet::new(),
         }
     }
 
@@ -176,6 +237,19 @@ mod tests {
         assert_eq!(drifts.len(), 1);
         assert_eq!(drifts[0].kind, DriftKind::BinaryMissing);
         assert!(drifts[0].detail.contains("ghost"));
+    }
+
+    #[test]
+    fn system_binary_absent_from_manifest_is_not_drift() {
+        // `git` isn't in the manifest, but it's a stock system tool, so the
+        // caller will have listed it in `system_bins` — no BinaryMissing.
+        let mut m = manifest_with(&[]);
+        m.system_bins.insert("git".to_owned());
+        assert!(classify(&inv("git", Some("status"), &["--short"]), &m).is_empty());
+        // A name resolvable nowhere still flags (the bootstrap-symlink case).
+        let drifts = classify(&inv("missing-local-tool", None, &[]), &m);
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].kind, DriftKind::BinaryMissing);
     }
 
     #[test]

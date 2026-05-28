@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 use skill_doctor::DriftKind;
-use skill_doctor::check::{classify, load_manifest};
+use skill_doctor::check::{classify, load_manifest, system_binaries};
 use skill_doctor::extract::{extract_from, skill_files};
 use skill_doctor::proposal::{ensure_dir, write_proposal};
 
@@ -133,7 +133,11 @@ fn cmd_check(skills_root: &Path, manifest_path: &Path, proposals_dir: &Path) -> 
         return Ok(ExitCode::from(2));
     }
 
-    let manifest = load_manifest(manifest_path)?;
+    let mut manifest = load_manifest(manifest_path)?;
+    // Stock system tools (git/sed/cargo/…) live on PATH but outside the
+    // manifest's remit; record them so unknown-binary drift fires only for
+    // genuinely-absent local tools, keeping the AC7 false-positive rate down.
+    manifest.system_bins = system_binaries();
     let dir = ensure_dir(proposals_dir)?;
     let before = count_md(&dir)?;
 
