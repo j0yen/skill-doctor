@@ -1,0 +1,63 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-skill-doctor.md",
+  "intent_slug": "skill-doctor",
+  "root_motivation": "Skill text (~/.claude/skills/*/SKILL.md) drifts from installed tool surfaces; four live drift instances already observed. The user wants automated detection that produces review-gated proposals rather than auto-edits, mirroring the recall observe pattern. Detection must be decoupled from application so the same checker can feed multiple downstream consumers later.",
+  "user_persona": "Claude (this agent) and the user (jsy) reviewing the proposal queue at ~/.claude/skill-doctor/proposals/*.md. Same review idiom as recall observe and freshness/recall-doctor-claims.",
+  "unfakeable_metric": {
+    "name": "ac_passing_count",
+    "lower_is_better": false,
+    "harness_command": "cargo test --release --quiet 2>&1 | grep -E '^test result' | awk '{s+=$4} END {print s}'",
+    "target": 11
+  },
+  "acceptance_criteria": [
+    {"id": "AC1", "level": "MUST", "description": "cargo build --release green on fresh clone; cargo test --release --lib green.", "test": "tests/acceptance_ac1.rs (cargo invariant verified by harness)"},
+    {"id": "AC2", "level": "MUST", "description": "skill-doctor check against live ~/.claude/skills/ produces >=4 drift proposals matching the four known instances.", "test": "tests/acceptance_ac2.rs (run check against fixture mirroring the live drift cases)"},
+    {"id": "AC3", "level": "MUST", "description": "Proposals written under ~/.claude/skill-doctor/proposals/<ULID>.md with the schema in PRD section Proposal output.", "test": "tests/acceptance_ac3.rs (parse generated proposal frontmatter + body shape)"},
+    {"id": "AC4", "level": "MUST", "description": "Re-running skill-doctor check does not create duplicate proposals for the same (skill_path, line, binary, drift_kind, detail) tuple.", "test": "tests/acceptance_ac4.rs (run check twice, assert proposal count unchanged on second)"},
+    {"id": "AC5", "level": "MUST", "description": "skill-doctor proposals reject <ULID> flips status: rejected; proposal disappears from list output.", "test": "tests/acceptance_ac5.rs (cli flow: create + reject + list)"},
+    {"id": "AC6", "level": "MUST", "description": "Missing tool-manifest handled gracefully: prints friendly error and exits 2 when ~/.claude/tool-manifest/manifest.json absent.", "test": "tests/acceptance_ac6.rs (env override manifest path to nonexistent file; assert exit 2 + stderr)"},
+    {"id": "AC7", "level": "SHOULD", "description": "False-positive rate <=30% on the live skill set: >=70% of generated proposals reflect actual drift.", "test": "Manual review of first batch; documented in postmortem (not gated by cargo test)"},
+    {"id": "AC8", "level": "MUST", "description": "Proposal queue path created with mode 0700.", "test": "tests/acceptance_ac8.rs (stat the directory after first run; assert mode & 0777 == 0o700)"},
+    {"id": "AC9", "level": "MUST", "description": "Crate published to github.com/j0yen/skill-doctor under dual MIT+Apache-2.0 license with README citing drift vision and tool-manifest dependency.", "test": "Stage 6 publish step + LICENSE-MIT + LICENSE-APACHE files present"},
+    {"id": "AC10", "level": "MUST", "description": "~/.local/bin/skill-doctor installed via bootstrap/install.sh; row added to ~/wintermute/REPOS.md.", "test": "Post-publish install + REPOS.md edit"},
+    {"id": "AC11", "level": "MAY", "description": "Verified-completed: user reviews first batch, runs proposals promote, applies a recommended edit by hand, confirms drift gone.", "test": "Manual user verification (post-ship)"}
+  ],
+  "scope": [
+    "Walk ~/.claude/skills/*/SKILL.md (case-folded)",
+    "Extract shell invocations from fenced bash/sh/shell blocks and backtick inline code",
+    "Cross-reference each invocation's binary/subcommand/flags against tool-manifest manifest.json",
+    "Park drift findings as proposal files at ~/.claude/skill-doctor/proposals/<ULID>.md",
+    "Dedupe pending proposals by content hash to make repeated runs idempotent",
+    "CLI surface: check, proposals list, proposals show, proposals reject, proposals promote"
+  ],
+  "non_goals": [
+    "Auto-edit of skill files (Fleet 2 candidate drift-skill-doctor-fix)",
+    "Walking ~/.config/** (Fleet 2 candidate drift-config-files)",
+    "Parsing multiline backslash-continuations, heredocs, or shell-variable-expanded commands",
+    "Auto-syncing the manifest in check (consumers must call tool-manifest sync explicitly)"
+  ],
+  "hard_constraints": {
+    "rust_edition": "2021",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": null,
+    "msrv": "1.85",
+    "additional": {
+      "license": "MIT OR Apache-2.0",
+      "proposal_dir_mode": "0700"
+    }
+  },
+  "five_whys_trace": [
+    {"why": 1, "q": "Why do we need skill-doctor?", "a": "Skill text drifts from installed tool surfaces and the user keeps spotting it manually."},
+    {"why": 2, "q": "Why does drift accumulate?", "a": "Skills are markdown maintained by humans (and Claude); installed binaries evolve independently. No automated cross-check."},
+    {"why": 3, "q": "Why a proposal queue instead of auto-edit?", "a": "False positives are inevitable when extracting shell from prose; review-gated changes mirror the recall observe pattern the user is already trained on."},
+    {"why": 4, "q": "Why must detection be decoupled from application?", "a": "So the same checker can feed multiple downstream consumers (drift-proposals skill, self-review Phase A integration) without re-implementing extraction."},
+    {"why": 5, "q": "Why tool-manifest as the ground truth (not parsing live --help)?", "a": "tool-manifest already ships, has the JSON format we need, supports query/show. Re-implementing --help probing here would couple skill-doctor to runtime binary presence and double the surface area to test."}
+  ],
+  "ambiguities_resolved": [
+    {"question": "Where do proposal files live?", "resolution": "~/.claude/skill-doctor/proposals/<ULID>.md (per PRD); mode 0700 per AC8 + recall observe convention."},
+    {"question": "How to identify candidate shell commands inside markdown prose?", "resolution": "Fenced bash/sh/shell blocks; backtick inline code starting with a known binary name (binary names sourced from tool-manifest)."}
+  ],
+  "created_at": "2026-05-28T12:30:00Z"
+}
