@@ -209,6 +209,13 @@ fn render(drift: &Drift, id: &str, created: &str, hash: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::missing_panics_doc,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::redundant_clone
+)]
 mod tests {
     use super::*;
     use crate::Invocation;
