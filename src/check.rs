@@ -6,7 +6,7 @@
 //! tool-manifest schema bump that adds fields won't break parsing.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -68,24 +68,36 @@ pub struct Manifest {
 /// `cargo`, `jq`, …).
 #[must_use]
 pub fn system_binaries() -> BTreeSet<String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let local_bin = std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/bin"));
     let Some(path) = std::env::var_os("PATH") else {
         return BTreeSet::new();
     };
+    system_binaries_in(std::env::split_paths(&path), local_bin.as_deref())
+}
+
+/// Core of [`system_binaries`], split out so tests can drive explicit dirs
+/// instead of mutating the process-global `PATH` (racy under parallel tests).
+fn system_binaries_in(dirs: impl Iterator<Item = PathBuf>, local_bin: Option<&Path>) -> BTreeSet<String> {
+    use std::os::unix::fs::PermissionsExt as _;
 
     let mut names = BTreeSet::new();
-    for dir in std::env::split_paths(&path) {
+    for dir in dirs {
         // Skip the local-bin dir: those tools are the manifest's job to track.
-        if local_bin.as_deref() == Some(dir.as_path()) {
+        if local_bin == Some(dir.as_path()) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
+            // `DirEntry::metadata()` is an `lstat` — it does NOT traverse
+            // symlinks, so a symlinked executable (`/usr/bin/awk -> gawk`,
+            // `/usr/sbin/npm -> …/npm-cli.js`) reports as a symlink rather
+            // than a file and gets dropped, re-surfacing as a `BinaryMissing`
+            // false positive (AC7). Stat through the link with `fs::metadata`
+            // so symlinks to executables count; broken links error out and
+            // are skipped, as intended.
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
                 continue;
             };
             // Regular file (or symlink to one) with any execute bit set.
@@ -228,6 +240,44 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn system_binaries_follows_symlinked_executables() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Mirrors the live regression: `/usr/bin/awk -> gawk`,
+        // `/usr/sbin/npm -> …/npm-cli.js`. A symlinked executable on PATH
+        // must be collected, else `classify` re-flags it as `BinaryMissing`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("gawk");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("write real exec");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod real exec");
+        std::os::unix::fs::symlink(&real, dir.path().join("awk")).expect("symlink awk->gawk");
+        // A dangling symlink must NOT be collected (it errors on stat).
+        std::os::unix::fs::symlink(dir.path().join("nope"), dir.path().join("broken"))
+            .expect("symlink broken");
+
+        let names = system_binaries_in(std::iter::once(dir.path().to_path_buf()), None);
+        assert!(names.contains("gawk"), "real executable collected");
+        assert!(names.contains("awk"), "symlink to executable collected");
+        assert!(!names.contains("broken"), "dangling symlink skipped");
+    }
+
+    #[test]
+    fn system_binaries_skips_local_bin_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The local-bin dir is the manifest's responsibility — its tools must
+        // stay candidates for `BinaryMissing`, so they're excluded here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = dir.path().join("recall");
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let names = system_binaries_in(std::iter::once(dir.path().to_path_buf()), Some(dir.path()));
+        assert!(!names.contains("recall"), "local-bin tool excluded");
     }
 
     #[test]
