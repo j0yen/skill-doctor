@@ -71,7 +71,15 @@ pub fn extract_from(skill_path: &Path, body: &str) -> Vec<Invocation> {
             Event::Code(text) => {
                 let line_no = offset_to_line(&line_starts, range.start);
                 if let Some(inv) = parse_invocation(skill_path, line_no, text.as_ref()) {
-                    out.push(inv);
+                    // Inline prose backticks are overwhelmingly names, not
+                    // commands. Only keep command-shaped spans — those with a
+                    // subcommand or a flag. A bare `tool` mention isn't a
+                    // verifiable invocation and was the dominant AC7
+                    // false-positive source (88% BinaryMissing over-harvest).
+                    // Fenced shell blocks keep emitting bare-binary lines.
+                    if inv.subcommand.is_some() || !inv.flags.is_empty() {
+                        out.push(inv);
+                    }
                 }
             }
             _ => {}
@@ -208,8 +216,27 @@ fn is_valid_binary_name(name: &str) -> bool {
     if !first.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
         return false;
     }
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    // Real binary names use lowercase letters, digits, and dashes. Reject the
+    // three dominant inline-prose false-positive shapes (PRD AC7, iter-12):
+    //   * dotted     -> filenames (`metrics.json`, `notes.md`) & dotted ids
+    //   * underscore -> snake_case identifiers / JSON keys (`build_auto`)
+    //   * ALLCAPS    -> placeholders (`ULID`, `RUST_LOG`)
+    // None of the ~/.local/bin toolkit (recall, ctrace, wm-push, txn-edit, …)
+    // or stock PATH tools (git, jq, sed) use these shapes, so this costs no
+    // real positive while killing the BinaryMissing over-harvest.
+    if name.contains('.') || name.contains('_') {
+        return false;
+    }
+    let has_letter = name.chars().any(|c| c.is_ascii_alphabetic());
+    if has_letter
+        && name
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .all(|c| c.is_ascii_uppercase())
+    {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn is_valid_subcommand(token: &str) -> bool {
@@ -377,6 +404,62 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].binary, "rg");
         assert_eq!(out[0].flags, vec!["-i"]);
+    }
+
+    #[test]
+    fn inline_filename_is_rejected() {
+        // Filenames in prose backticks were a top AC7 false positive.
+        let md = "Receipts land in `metrics.json` and notes go to `notes.md`.\n";
+        assert!(extract_from(p(), md).is_empty());
+    }
+
+    #[test]
+    fn inline_allcaps_placeholder_is_rejected() {
+        let md = "Promote it with the `ULID` and set `RUST_LOG`.\n";
+        assert!(extract_from(p(), md).is_empty());
+    }
+
+    #[test]
+    fn inline_snake_case_identifier_is_rejected() {
+        // JSON keys / config identifiers in prose are not invocations.
+        let md = "The `build_auto` field and `output_repo_path` are read.\n";
+        assert!(extract_from(p(), md).is_empty());
+    }
+
+    #[test]
+    fn inline_bare_tool_mention_is_rejected() {
+        // A bare `tool` mention has no subcommand or flag: not a verifiable
+        // invocation, even though the binary name is well-formed.
+        let md = "We rely on `recall` and `ctrace` throughout.\n";
+        assert!(extract_from(p(), md).is_empty());
+    }
+
+    #[test]
+    fn inline_command_shaped_span_still_captured() {
+        // Regression guard: a real inline invocation (sub + flag) survives.
+        let md = "Run `bpolicy status --format=json` to check.\n";
+        let out = extract_from(p(), md);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].binary, "bpolicy");
+    }
+
+    #[test]
+    fn fenced_bare_binary_still_captured() {
+        // The command-shape gate is inline-only; fenced shell lines keep
+        // emitting bare-binary invocations.
+        let md = "```bash\nrecall\n```\n";
+        let out = extract_from(p(), md);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].binary, "recall");
+        assert!(out[0].subcommand.is_none());
+    }
+
+    #[test]
+    fn fenced_identifier_shapes_are_rejected() {
+        // Even inside a shell fence, filename/identifier/placeholder shapes
+        // are not valid binary names.
+        let md = "```bash\nmetrics.json\nbuild_auto\nULID\n```\n";
+        assert!(extract_from(p(), md).is_empty());
     }
 
     #[test]
