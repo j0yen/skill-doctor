@@ -62,7 +62,7 @@ pub fn extract_from(skill_path: &Path, body: &str) -> Vec<Invocation> {
                 for raw_line in text.split_inclusive('\n') {
                     let doc_offset = range.start + local_offset;
                     let line_no = offset_to_line(&line_starts, doc_offset);
-                    if let Some(inv) = parse_invocation(skill_path, line_no, raw_line) {
+                    for inv in parse_segments(skill_path, line_no, raw_line) {
                         out.push(inv);
                     }
                     local_offset += raw_line.len();
@@ -70,7 +70,7 @@ pub fn extract_from(skill_path: &Path, body: &str) -> Vec<Invocation> {
             }
             Event::Code(text) => {
                 let line_no = offset_to_line(&line_starts, range.start);
-                if let Some(inv) = parse_invocation(skill_path, line_no, text.as_ref()) {
+                for inv in parse_segments(skill_path, line_no, text.as_ref()) {
                     // Inline prose backticks are overwhelmingly names, not
                     // commands. Only keep command-shaped spans — those with a
                     // subcommand or a flag. A bare `tool` mention isn't a
@@ -104,6 +104,29 @@ fn offset_to_line(line_starts: &[usize], offset: usize) -> usize {
         Ok(i) => i + 1,
         Err(i) => i,
     }
+}
+
+/// Split a raw command line on shell pipeline/sequence operators and parse
+/// each segment as an independent invocation.
+///
+/// Without this, flags from downstream piped commands bleed onto the head
+/// binary and become `FlagUnknown` false positives — the dominant remaining
+/// AC7 noise source. A line like
+/// `recall list --limit 200 | sort | uniq -c | sort -rn` was parsed as a
+/// single `recall list` call carrying `-c`/`-rn` (which belong to `uniq` and
+/// `sort`), and `agorabus peers | jq -r …` attributed jq's `-r` to
+/// `agorabus peers`. Splitting yields the head invocation cleanly; the
+/// downstream segments resolve to stock PATH tools (`jq`/`sort`/`uniq`/`wc`)
+/// that `check::classify` already suppresses via `system_bins`, so no new
+/// `BinaryMissing` false positives are introduced.
+fn parse_segments<'a>(
+    skill_path: &'a Path,
+    line: usize,
+    raw_line: &'a str,
+) -> impl Iterator<Item = Invocation> + 'a {
+    raw_line
+        .split(['|', '&', ';'])
+        .filter_map(move |seg| parse_invocation(skill_path, line, seg))
 }
 
 fn parse_invocation(skill_path: &Path, line: usize, raw_line: &str) -> Option<Invocation> {
@@ -227,13 +250,13 @@ fn is_valid_binary_name(name: &str) -> bool {
     if name.contains('.') || name.contains('_') {
         return false;
     }
-    let has_letter = name.chars().any(|c| c.is_ascii_alphabetic());
-    if has_letter
-        && name
-            .chars()
-            .filter(char::is_ascii_alphabetic)
-            .all(|c| c.is_ascii_uppercase())
-    {
+    // Real Unix binaries are lowercase by convention — none of the local
+    // toolkit (recall, ctrace, wm-push, …) or stock PATH tools (git, jq, sed)
+    // carry an uppercase letter. Any uppercase marks a prose token, not an
+    // invocation: capitalized template headings (`Self-review YYYY-MM-DD`)
+    // and ALLCAPS placeholders (`ULID`, `RUST_LOG`) were both AC7 false
+    // positives. Rejecting any uppercase subsumes the old ALLCAPS-only check.
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
         return false;
     }
     name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -459,6 +482,43 @@ mod tests {
         // Even inside a shell fence, filename/identifier/placeholder shapes
         // are not valid binary names.
         let md = "```bash\nmetrics.json\nbuild_auto\nULID\n```\n";
+        assert!(extract_from(p(), md).is_empty());
+    }
+
+    #[test]
+    fn piped_flags_do_not_bleed_onto_head_binary() {
+        // AC7 regression: downstream `sort -rn` / `uniq -c` / `wc -l` flags
+        // must not attach to the head `recall list` invocation. Each pipe
+        // segment becomes its own invocation.
+        let md = "```bash\nrecall list --limit 200 | sort | uniq -c | sort -rn\n```\n";
+        let out = extract_from(p(), md);
+        let recall: Vec<&Invocation> = out.iter().filter(|i| i.binary == "recall").collect();
+        assert_eq!(recall.len(), 1);
+        assert_eq!(recall[0].subcommand.as_deref(), Some("list"));
+        assert_eq!(recall[0].flags, vec!["--limit"]);
+        // sort/uniq surface as their own bare invocations (classify suppresses
+        // them as system tools); the point is they aren't fused into recall.
+        assert!(out.iter().any(|i| i.binary == "uniq" && i.flags == vec!["-c"]));
+        assert!(out.iter().any(|i| i.binary == "sort" && i.flags == vec!["-rn"]));
+    }
+
+    #[test]
+    fn jq_flags_do_not_bleed_onto_piped_head() {
+        // `agorabus peers | jq -r '…'` must not record `-r` against
+        // `agorabus peers` (jq owns it).
+        let md = "Run `agorabus peers | jq -r '.[].session_id'` to list peers.\n";
+        let out = extract_from(p(), md);
+        let agora: Vec<&Invocation> = out.iter().filter(|i| i.binary == "agorabus").collect();
+        assert_eq!(agora.len(), 1);
+        assert_eq!(agora[0].subcommand.as_deref(), Some("peers"));
+        assert!(agora[0].flags.is_empty());
+    }
+
+    #[test]
+    fn capitalized_prose_token_is_rejected() {
+        // `Self-review YYYY-MM-DD:` is a template heading in prose, not an
+        // invocation. Uppercase in the binary position marks prose (AC7).
+        let md = "```bash\nSelf-review status --format json\n```\n";
         assert!(extract_from(p(), md).is_empty());
     }
 
